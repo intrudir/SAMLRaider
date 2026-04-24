@@ -1,10 +1,16 @@
 package gui;
 
 import application.SamlTabController;
+import helpers.CommentInjection;
 import helpers.CVE_2022_41912;
+import helpers.CVE_2024_45409;
 import helpers.CVE_2025_23369;
 import helpers.CVE_2025_25291;
 import helpers.CVE_2025_25292;
+import helpers.EncryptionSSRF;
+import helpers.IssuerConfusion;
+import helpers.PIInjection;
+import helpers.SignatureRefSSRF;
 import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.Font;
@@ -15,18 +21,17 @@ import java.awt.event.ActionListener;
 import java.io.Serial;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Optional;
-import javax.swing.BorderFactory;
 import javax.swing.DefaultComboBoxModel;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
-import javax.swing.JScrollPane;
+
+import javax.swing.JTabbedPane;
 import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
-import javax.swing.border.EmptyBorder;
+
 import model.BurpCertificate;
 import net.miginfocom.swing.MigLayout;
 
@@ -48,10 +53,31 @@ public class SamlPanelAction extends JPanel {
 
     private final JButton btnTestXXE = new JButton("Test XXE");
     private final JButton btnTestXSLT = new JButton("Test XSLT");
+    private final JButton btnKeyInfoSSRF = new JButton("KeyInfo SSRF");
+    private final JComboBox<SignatureRefSSRF.Mode> cmbboxSigRefMode =
+            new JComboBox<>(SignatureRefSSRF.Mode.values());
+    private final JButton btnSigRefSSRF = new JButton("SigRef SSRF");
 
     private final JComboBox<String> cmbboxCVE = new JComboBox<>();
     private final JButton btnCVEApply = new JButton("Apply CVE");
     private final JButton btnCVEHelp = new JButton("?");
+
+    private final JComboBox<CommentInjection.Position> cmbboxCommentPos = new JComboBox<>(CommentInjection.Position.values());
+    private final JButton btnCommentInject = new JButton("Inject Comment");
+    private final JComboBox<PIInjection.Position> cmbboxPIPos = new JComboBox<>(PIInjection.Position.values());
+    private final JButton btnPIInject     = new JButton("Inject PI");
+    private final JButton btnHMACConfusion = new JButton("HMAC Confusion");
+    private final JButton btnResponseXSS   = new JButton("Inject XSS");
+    private final JComboBox<IssuerConfusion.Mode> cmbboxIssuerMode = new JComboBox<>(IssuerConfusion.Mode.values());
+    private final JButton btnIssuerConfuse = new JButton("Confuse Issuer");
+
+    private final JButton btnExtendValidity = new JButton("Extend Validity +24h");
+    private final JButton btnStatusSuccess  = new JButton("Status → Success");
+    private final JButton btnRemoveAudience = new JButton("Remove Audience");
+    private final JButton btnDigestTamper   = new JButton("Corrupt Digest");
+
+    private final JComboBox<EncryptionSSRF.Mode> cmbboxEncMode = new JComboBox<>(EncryptionSSRF.Mode.values());
+    private final JButton btnEncSSRF = new JButton("Enc SSRF");
 
     private final JButton btnSignatureHelp = new JButton("?");
     private final JComboBox<BurpCertificate> cmbboxCertificate = new JComboBox<>();
@@ -59,7 +85,12 @@ public class SamlPanelAction extends JPanel {
     private final JButton btnResignAssertion = new JButton("(Re-)Sign Assertion");
     private final JButton btnSendCertificate = new JButton("Store Certificate");
     private final JButton btnResignMessage = new JButton("(Re-)Sign Message");
+    private final JButton btnDupeKey = new JButton("Dupe Key Confusion");
 
+    private final JButton btnACSSpoof = new JButton("Spoof ACS URL");
+    private final JButton btnMetadataImport = new JButton("Import Metadata");
+
+    private final JLabel lblSigStatus = new JLabel();
 
     public SamlPanelAction() {
         initialize();
@@ -71,13 +102,10 @@ public class SamlPanelAction extends JPanel {
     }
 
     private void initialize() {
-        btnMessageReset.addActionListener(event -> {
-            controller.resetMessage();
-        });
-
+        // --- Wire listeners ---
+        btnMessageReset.addActionListener(event -> controller.resetMessage());
         btnFormatXml.addActionListener(event -> controller.formatXml());
 
-        // --- Wire listeners ---
         btnXSWHelp.addActionListener(event -> controller.showXSWHelp());
         btnXSWPreview.addActionListener(event -> controller.showXSWPreview());
         btnMatchAndReplace.addActionListener(event -> showMatchAndReplaceDialog());
@@ -87,66 +115,163 @@ public class SamlPanelAction extends JPanel {
                 OobDomainDialog.prompt(this, "XXE — OOB Domain")
                         .ifPresent(controller::applyXXE));
         btnTestXSLT.addActionListener(event ->
-                OobDomainDialog.prompt(this, "XSLT — OOB Domain")
-                        .ifPresent(controller::applyXSLT));
+                XSLTPayloadDialog.prompt(this)
+                        .ifPresent(sel -> controller.applyXSLT(sel.flavor(), sel.param())));
+        btnKeyInfoSSRF.addActionListener(event ->
+                OobDomainDialog.prompt(this, "KeyInfo SSRF — Retrieval URL")
+                        .ifPresent(controller::applyKeyInfoSSRF));
+        btnSigRefSSRF.addActionListener(event ->
+                OobDomainDialog.prompt(this, "SigRef SSRF — URL")
+                        .ifPresent(url -> controller.applySignatureRefSSRF(
+                                (SignatureRefSSRF.Mode) cmbboxSigRefMode.getSelectedItem(), url)));
+        btnEncSSRF.addActionListener(event ->
+                OobDomainDialog.prompt(this, "Encryption SSRF — Fetch URL")
+                        .ifPresent(url -> controller.applyEncryptionSSRF(
+                                (EncryptionSSRF.Mode) cmbboxEncMode.getSelectedItem(), url)));
 
         cmbboxCVE.setModel(new DefaultComboBoxModel<>(new String[]{
-                CVE_2022_41912.CVE, CVE_2025_23369.CVE,
+                CVE_2022_41912.CVE, CVE_2024_45409.CVE, CVE_2025_23369.CVE,
                 CVE_2025_25291.CVE, CVE_2025_25292.CVE }));
         btnCVEApply.addActionListener(event -> controller.applyCVE());
         btnCVEHelp.addActionListener(event -> controller.showCVEHelp());
+
+        btnCommentInject.addActionListener(event ->
+                controller.applyCommentInjection(
+                        (CommentInjection.Position) cmbboxCommentPos.getSelectedItem()));
+        btnPIInject.addActionListener(event ->
+                controller.applyPIInjection(
+                        (PIInjection.Position) cmbboxPIPos.getSelectedItem()));
+        btnHMACConfusion.addActionListener(event -> controller.applyHMACConfusion());
+        btnResponseXSS.addActionListener(event ->
+                XSSPayloadDialog.prompt(this)
+                        .ifPresent(sel -> controller.applyResponseXSS(sel.target(), sel.payload())));
+        btnIssuerConfuse.addActionListener(event ->
+                controller.applyIssuerConfusion(
+                        (IssuerConfusion.Mode) cmbboxIssuerMode.getSelectedItem()));
+
+        btnExtendValidity.addActionListener(event -> controller.applyExtendValidity(24));
+        btnStatusSuccess.addActionListener(event -> controller.applyStatusSuccess());
+        btnRemoveAudience.addActionListener(event -> controller.applyRemoveAudience());
+        btnDigestTamper.addActionListener(event -> controller.applyDigestTamper());
+
+        btnACSSpoof.addActionListener(event ->
+                OobDomainDialog.prompt(this, "ACS Spoof — Attacker URL")
+                        .ifPresent(controller::applyACSSpoof));
+        btnMetadataImport.addActionListener(event ->
+                MetadataImportDialog.prompt(this).ifPresent(controller::importMetadata));
 
         btnSignatureHelp.addActionListener(event -> controller.showSignatureHelp());
         btnSignatureRemove.addActionListener(event -> controller.removeSignature());
         btnResignAssertion.addActionListener(event -> controller.resignAssertion());
         btnSendCertificate.addActionListener(event -> controller.sendToCertificatesTab());
         btnResignMessage.addActionListener(event -> controller.resignMessage());
+        btnDupeKey.addActionListener(event -> controller.applyDupeKeyConfusion());
 
-        // --- Compact layout: labeled sections with separators ---
-        var panel = new JPanel(new MigLayout("insets 6 8 6 8, gap 4 6, fillx", "[grow]", ""));
+        // --- Layout ---
 
-        // Row 1: Message
-        panel.add(sectionLabel("Message"), "split");
-        panel.add(btnMessageReset);
-        panel.add(btnFormatXml, "wrap");
+        // Top bar: message utilities, always visible
+        var topBar = new JPanel(new MigLayout("insets 4 8 4 8, gap 6"));
+        topBar.add(btnMessageReset);
+        topBar.add(btnFormatXml);
 
-        panel.add(separator(), "growx, wrap");
+        // Attack tabs
+        var tabs = new JTabbedPane(JTabbedPane.TOP);
+        tabs.addTab("Signatures", buildSignaturesTab());
+        tabs.addTab("Injection",  buildInjectionTab());
+        tabs.addTab("SSRF / RCE", buildSSRFTab());
+        tabs.addTab("Assertion",  buildAssertionTab());
+        tabs.addTab("CVE",        buildCVETab());
+        tabs.addTab("XSW",        buildXSWTab());
+        tabs.addTab("Request",    buildRequestTab());
 
-        // Row 2: XSW
-        panel.add(sectionLabel("XSW"), "split");
-        panel.add(cmbboxXSW);
-        panel.add(btnXSWApply);
-        panel.add(btnMatchAndReplace);
-        panel.add(btnXSWPreview);
-        panel.add(btnXSWHelp, "wrap");
-
-        // Row 3: CVE
-        panel.add(sectionLabel("CVE"), "split");
-        panel.add(cmbboxCVE);
-        panel.add(btnCVEApply);
-        panel.add(btnCVEHelp, "wrap");
-
-        // Row 4: XML
-        panel.add(sectionLabel("XML"), "split");
-        panel.add(btnTestXXE);
-        panel.add(btnTestXSLT, "wrap");
-
-        panel.add(separator(), "growx, wrap");
-
-        // Row 5: Signing
-        panel.add(sectionLabel("Signing"), "split");
-        panel.add(cmbboxCertificate);
-        panel.add(btnResignAssertion);
-        panel.add(btnResignMessage);
-        panel.add(btnSignatureRemove);
-        panel.add(btnSignatureHelp, "wrap");
-
-        // Row 6: Store Certificate (under Signing)
-        panel.add(new JLabel(""), "split"); // indent to align
-        panel.add(btnSendCertificate, "wrap");
+        // Bottom bar: signing, always visible
+        var bottomBar = new JPanel(new MigLayout("insets 6 8 6 8, gap 6, fillx"));
+        bottomBar.add(sectionLabel("Signing"), "");
+        bottomBar.add(cmbboxCertificate);
+        bottomBar.add(btnResignAssertion);
+        bottomBar.add(btnResignMessage);
+        bottomBar.add(btnSignatureRemove);
+        bottomBar.add(btnSignatureHelp, "wrap");
+        bottomBar.add(new JLabel(""), "");
+        bottomBar.add(btnSendCertificate, "wrap");
+        lblSigStatus.setVisible(false);
+        bottomBar.add(lblSigStatus, "span, wrap");
 
         setLayout(new BorderLayout());
-        add(panel, BorderLayout.NORTH);
+        add(topBar, BorderLayout.NORTH);
+        add(tabs, BorderLayout.CENTER);
+        add(bottomBar, BorderLayout.SOUTH);
+    }
+
+    // --- Tab builders ---
+
+    private JPanel buildSignaturesTab() {
+        var p = tabPanel();
+        p.add(btnHMACConfusion, "");
+        p.add(btnDupeKey, "");
+        p.add(btnDigestTamper, "wrap");
+        return p;
+    }
+
+    private JPanel buildInjectionTab() {
+        var p = tabPanel();
+        p.add(cmbboxCommentPos, "");
+        p.add(btnCommentInject, "wrap");
+        p.add(cmbboxPIPos, "");
+        p.add(btnPIInject, "wrap");
+        p.add(btnResponseXSS, "wrap");
+        p.add(cmbboxIssuerMode, "");
+        p.add(btnIssuerConfuse, "wrap");
+        return p;
+    }
+
+    private JPanel buildSSRFTab() {
+        var p = tabPanel();
+        p.add(btnTestXXE, "");
+        p.add(btnTestXSLT, "wrap");
+        p.add(btnKeyInfoSSRF, "wrap");
+        p.add(cmbboxSigRefMode, "");
+        p.add(btnSigRefSSRF, "wrap");
+        p.add(cmbboxEncMode, "");
+        p.add(btnEncSSRF, "wrap");
+        return p;
+    }
+
+    private JPanel buildAssertionTab() {
+        var p = tabPanel();
+        p.add(btnExtendValidity, "");
+        p.add(btnStatusSuccess, "wrap");
+        p.add(btnRemoveAudience, "wrap");
+        return p;
+    }
+
+    private JPanel buildCVETab() {
+        var p = tabPanel();
+        p.add(cmbboxCVE, "");
+        p.add(btnCVEApply, "");
+        p.add(btnCVEHelp, "wrap");
+        return p;
+    }
+
+    private JPanel buildXSWTab() {
+        var p = tabPanel();
+        p.add(cmbboxXSW, "");
+        p.add(btnXSWApply, "");
+        p.add(btnMatchAndReplace, "");
+        p.add(btnXSWPreview, "");
+        p.add(btnXSWHelp, "wrap");
+        return p;
+    }
+
+    private JPanel buildRequestTab() {
+        var p = tabPanel();
+        p.add(btnACSSpoof, "wrap");
+        p.add(btnMetadataImport, "wrap");
+        return p;
+    }
+
+    private static JPanel tabPanel() {
+        return new JPanel(new MigLayout("insets 10, gap 6 8, fillx"));
     }
 
     private static JLabel sectionLabel(String text) {
@@ -155,13 +280,10 @@ public class SamlPanelAction extends JPanel {
         return label;
     }
 
-    private static javax.swing.JSeparator separator() {
-        return new javax.swing.JSeparator(javax.swing.SwingConstants.HORIZONTAL);
-    }
+    // --- Public API ---
 
     public void setCertificateList(List<BurpCertificate> list) {
         DefaultComboBoxModel<BurpCertificate> model = new DefaultComboBoxModel<BurpCertificate>();
-
         for (BurpCertificate cert : list) {
             model.addElement(cert);
         }
@@ -185,6 +307,15 @@ public class SamlPanelAction extends JPanel {
         return (String) cmbboxCVE.getSelectedItem();
     }
 
+    public void setSignatureStatus(boolean stale) {
+        if (stale) {
+            lblSigStatus.setText("<html><b>&#9888; Stale signature</b> — forward as-is to test SP signature validation, or re-sign above</html>");
+            lblSigStatus.setVisible(true);
+        } else {
+            lblSigStatus.setVisible(false);
+        }
+    }
+
     public void disableControls() {
         cmbboxCertificate.setEnabled(false);
         cmbboxXSW.setEnabled(false);
@@ -201,8 +332,28 @@ public class SamlPanelAction extends JPanel {
         btnFormatXml.setEnabled(false);
         btnTestXXE.setEnabled(false);
         btnTestXSLT.setEnabled(false);
+        btnKeyInfoSSRF.setEnabled(false);
         cmbboxCVE.setEnabled(false);
         btnCVEApply.setEnabled(false);
+        cmbboxCommentPos.setEnabled(false);
+        btnCommentInject.setEnabled(false);
+        btnHMACConfusion.setEnabled(false);
+        btnResponseXSS.setEnabled(false);
+        btnExtendValidity.setEnabled(false);
+        btnStatusSuccess.setEnabled(false);
+        btnRemoveAudience.setEnabled(false);
+        btnDigestTamper.setEnabled(false);
+        cmbboxEncMode.setEnabled(false);
+        btnEncSSRF.setEnabled(false);
+        cmbboxSigRefMode.setEnabled(false);
+        btnSigRefSSRF.setEnabled(false);
+        cmbboxPIPos.setEnabled(false);
+        btnPIInject.setEnabled(false);
+        cmbboxIssuerMode.setEnabled(false);
+        btnIssuerConfuse.setEnabled(false);
+        btnDupeKey.setEnabled(false);
+        btnACSSpoof.setEnabled(false);
+        btnMetadataImport.setEnabled(false);
         this.revalidate();
     }
 
@@ -222,8 +373,28 @@ public class SamlPanelAction extends JPanel {
         btnFormatXml.setEnabled(true);
         btnTestXXE.setEnabled(true);
         btnTestXSLT.setEnabled(true);
+        btnKeyInfoSSRF.setEnabled(true);
         cmbboxCVE.setEnabled(true);
         btnCVEApply.setEnabled(true);
+        cmbboxCommentPos.setEnabled(true);
+        btnCommentInject.setEnabled(true);
+        btnHMACConfusion.setEnabled(true);
+        btnResponseXSS.setEnabled(true);
+        btnExtendValidity.setEnabled(true);
+        btnStatusSuccess.setEnabled(true);
+        btnRemoveAudience.setEnabled(true);
+        btnDigestTamper.setEnabled(true);
+        cmbboxEncMode.setEnabled(true);
+        btnEncSSRF.setEnabled(true);
+        cmbboxSigRefMode.setEnabled(true);
+        btnSigRefSSRF.setEnabled(true);
+        cmbboxPIPos.setEnabled(true);
+        btnPIInject.setEnabled(true);
+        cmbboxIssuerMode.setEnabled(true);
+        btnIssuerConfuse.setEnabled(true);
+        btnDupeKey.setEnabled(true);
+        btnACSSpoof.setEnabled(true);
+        btnMetadataImport.setEnabled(true);
         this.revalidate();
     }
 
@@ -238,7 +409,7 @@ public class SamlPanelAction extends JPanel {
         JTextField matchInputText = new JTextField();
         JTextField replaceInputText = new JTextField();
 
-        JButton addEntryButton = new JButton("\u2795");
+        JButton addEntryButton = new JButton("➕");
         addEntryButton.addActionListener(new ActionListener() {
 
             @Override
@@ -281,7 +452,7 @@ public class SamlPanelAction extends JPanel {
 
             c.gridx = 1;
             listPanel.add(new JLabel(matchAndReplaceMap.get(matchRule)), c);
-            JButton deleteEntryBtn = new JButton("\u2796");
+            JButton deleteEntryBtn = new JButton("➖");
             deleteEntryBtn.addActionListener(new ActionListener() {
 
                 @Override

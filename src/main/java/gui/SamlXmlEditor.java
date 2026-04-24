@@ -48,6 +48,7 @@ public class SamlXmlEditor extends JPanel {
     private final AtomicBoolean modified = new AtomicBoolean(false);
     private volatile boolean suppressEvents = false;
     private boolean softWrap = false;
+    private Runnable onUserEditCallback;
 
     // Search
     private final JTextField searchField;
@@ -109,6 +110,7 @@ public class SamlXmlEditor extends JPanel {
                 if (!suppressEvents) {
                     modified.set(true);
                     highlightTimer.restart();
+                    if (onUserEditCallback != null) onUserEditCallback.run();
                 }
             }
         });
@@ -441,6 +443,10 @@ public class SamlXmlEditor extends JPanel {
     /* ------------------------------------------------------------------ */
     /*  Public API                                                        */
     /* ------------------------------------------------------------------ */
+
+    public void setOnUserEditCallback(Runnable callback) {
+        this.onUserEditCallback = callback;
+    }
 
     public void setText(String text) {
         suppressEvents = true;
