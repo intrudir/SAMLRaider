@@ -30,6 +30,7 @@ dependencies {
 	testImplementation libs.net.portswigger.burp.extensions.montoya.api
 	testImplementation libs.org.bouncycastle.bcpkix.jdk15on
 	testImplementation libs.org.junit.jupiter
+	testRuntimeOnly libs.org.junit.platform.launcher
 }
 
 tasks.withType(JavaCompile).configureEach {
