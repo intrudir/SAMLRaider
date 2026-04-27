@@ -44,6 +44,32 @@ public class AssertionManipulator {
         return xmlHelpers.getString(document);
     }
 
+    /// Resets all SAML timestamps to a fresh window centred on now:
+    ///   IssueInstant / AuthnInstant = now
+    ///   NotBefore                   = now − 1 h  (absorbs clock skew)
+    ///   NotOnOrAfter / SessionNotOnOrAfter = now + 1 h
+    ///
+    /// Use this when replaying a captured assertion — the validity window has
+    /// expired but all structural content is still what you want to test.
+    public static String refreshTimestamps(String samlMessage)
+            throws SAXException, IOException {
+        XMLHelpers xmlHelpers = new XMLHelpers();
+        Document document = xmlHelpers.getXMLDocumentOfSAMLMessage(samlMessage);
+
+        long now = System.currentTimeMillis();
+        String tNow   = samlTime(now);
+        String past   = samlTime(now - 3_600_000L);
+        String future = samlTime(now + 3_600_000L);
+
+        updateAttr(document, "IssueInstant",        tNow);
+        updateAttr(document, "AuthnInstant",         tNow);
+        updateAttr(document, "NotBefore",            past);
+        updateAttr(document, "NotOnOrAfter",         future);
+        updateAttr(document, "SessionNotOnOrAfter",  future);
+
+        return xmlHelpers.getString(document);
+    }
+
     // --- Status code manipulation ---
 
     /// Replaces every StatusCode Value with the SAML 2.0 Success URI.

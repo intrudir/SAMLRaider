@@ -21,6 +21,7 @@ package helpers;
 public class XSLTPayloads {
 
     public enum Flavor {
+        ALL("All 3 — Saxon SSRF + Xalan RCE (curl) + Class Instantiation"),
         SAXON_UNPARSED_TEXT("Saxon unparsed-text — blind SSRF (XSLT 2.0)"),
         XALAN_RUNTIME_EXEC("Xalan Runtime.exec — Java RCE (xmlsec ≤ 1.4.1)"),
         XALAN_CLASS_INSTANTIATION("Xalan DocumentHandler class instantiation (CVE-2014-0107)");
@@ -43,6 +44,7 @@ public class XSLTPayloads {
             case SAXON_UNPARSED_TEXT -> saxonUnparsedText(param);
             case XALAN_RUNTIME_EXEC -> xalanRuntimeExec(param);
             case XALAN_CLASS_INSTANTIATION -> xalanClassInstantiation(param);
+            case ALL -> throw new IllegalArgumentException("ALL is handled by the caller — call stylesheetFor per-flavor");
         };
     }
 

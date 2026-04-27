@@ -33,6 +33,8 @@ public class EncryptionSSRF {
     private static final String DS_NS   = "http://www.w3.org/2000/09/xmldsig#";
 
     public enum Mode {
+        ALL(
+                "All 3 — CipherReference + DataReference + EncryptedKey KeyInfo"),
         CIPHER_REFERENCE(
                 "CipherReference — ciphertext fetched from URL during decrypt"),
         DATA_REFERENCE(
@@ -55,8 +57,13 @@ public class EncryptionSSRF {
         Document document = xmlHelpers.getXMLDocumentOfSAMLMessage(samlMessage);
 
         switch (mode) {
-            case CIPHER_REFERENCE     -> applyCipherReference(document, url);
-            case DATA_REFERENCE       -> applyDataReference(document, url);
+            case ALL -> {
+                applyCipherReference(document, url);
+                applyDataReference(document, url);
+                applyEncryptedKeyKeyInfo(document, url);
+            }
+            case CIPHER_REFERENCE      -> applyCipherReference(document, url);
+            case DATA_REFERENCE        -> applyDataReference(document, url);
             case ENCRYPTED_KEY_KEYINFO -> applyEncryptedKeyKeyInfo(document, url);
         }
 

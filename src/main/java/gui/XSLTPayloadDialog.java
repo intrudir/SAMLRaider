@@ -45,10 +45,11 @@ public class XSLTPayloadDialog {
             boolean isRuntime = f == XSLTPayloads.Flavor.XALAN_RUNTIME_EXEC;
             paramLabel.setText(isRuntime ? "Shell command:" : "URL:");
             useCollab.setEnabled(isPro && !isRuntime);
-            if (isRuntime) {
-                useCollab.setSelected(false);
-            }
+            if (isRuntime) useCollab.setSelected(false);
             paramField.setEnabled(!useCollab.isSelected());
+            if (f == XSLTPayloads.Flavor.ALL) {
+                paramLabel.setText("URL (used for SSRF probes; curl <url> auto-generated for RCE):");
+            }
         };
         flavorCombo.addActionListener(e -> refresh.run());
         useCollab.addActionListener(e -> paramField.setEnabled(!useCollab.isSelected()));

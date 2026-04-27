@@ -71,10 +71,14 @@ public class SamlPanelAction extends JPanel {
     private final JComboBox<IssuerConfusion.Mode> cmbboxIssuerMode = new JComboBox<>(IssuerConfusion.Mode.values());
     private final JButton btnIssuerConfuse = new JButton("Confuse Issuer");
 
+    private final JButton btnRefreshTimestamps = new JButton("Refresh Timestamps");
     private final JButton btnExtendValidity = new JButton("Extend Validity +24h");
     private final JButton btnStatusSuccess  = new JButton("Status → Success");
     private final JButton btnRemoveAudience = new JButton("Remove Audience");
     private final JButton btnDigestTamper   = new JButton("Corrupt Digest");
+    private final JComboBox<helpers.AssertionEncryptor.KeyInfoStyle> cmbboxKeyInfoStyle =
+            new JComboBox<>(helpers.AssertionEncryptor.KeyInfoStyle.values());
+    private final JButton btnEncryptAssertion = new JButton("Encrypt Assertion");
 
     private final JComboBox<EncryptionSSRF.Mode> cmbboxEncMode = new JComboBox<>(EncryptionSSRF.Mode.values());
     private final JButton btnEncSSRF = new JButton("Enc SSRF");
@@ -149,10 +153,12 @@ public class SamlPanelAction extends JPanel {
                 controller.applyIssuerConfusion(
                         (IssuerConfusion.Mode) cmbboxIssuerMode.getSelectedItem()));
 
+        btnRefreshTimestamps.addActionListener(event -> controller.applyRefreshTimestamps());
         btnExtendValidity.addActionListener(event -> controller.applyExtendValidity(24));
         btnStatusSuccess.addActionListener(event -> controller.applyStatusSuccess());
         btnRemoveAudience.addActionListener(event -> controller.applyRemoveAudience());
         btnDigestTamper.addActionListener(event -> controller.applyDigestTamper());
+        btnEncryptAssertion.addActionListener(event -> controller.applyEncryptAssertion());
 
         btnACSSpoof.addActionListener(event ->
                 OobDomainDialog.prompt(this, "ACS Spoof — Attacker URL")
@@ -186,7 +192,7 @@ public class SamlPanelAction extends JPanel {
 
         // Bottom bar: signing, always visible
         var bottomBar = new JPanel(new MigLayout("insets 6 8 6 8, gap 6, fillx"));
-        bottomBar.add(sectionLabel("Signing"), "");
+        bottomBar.add(sectionLabel("Certificate:"), "");
         bottomBar.add(cmbboxCertificate);
         bottomBar.add(btnResignAssertion);
         bottomBar.add(btnResignMessage);
@@ -239,9 +245,12 @@ public class SamlPanelAction extends JPanel {
 
     private JPanel buildAssertionTab() {
         var p = tabPanel();
-        p.add(btnExtendValidity, "");
-        p.add(btnStatusSuccess, "wrap");
+        p.add(btnRefreshTimestamps, "");
+        p.add(btnExtendValidity, "wrap");
+        p.add(btnStatusSuccess, "");
         p.add(btnRemoveAudience, "wrap");
+        p.add(cmbboxKeyInfoStyle, "");
+        p.add(btnEncryptAssertion, "wrap");
         return p;
     }
 
@@ -271,7 +280,7 @@ public class SamlPanelAction extends JPanel {
     }
 
     private static JPanel tabPanel() {
-        return new JPanel(new MigLayout("insets 10, gap 6 8, fillx"));
+        return new JPanel(new MigLayout("insets 10, gap 6 8"));
     }
 
     private static JLabel sectionLabel(String text) {
@@ -292,6 +301,10 @@ public class SamlPanelAction extends JPanel {
 
     public BurpCertificate getSelectedCertificate() {
         return (BurpCertificate) cmbboxCertificate.getSelectedItem();
+    }
+
+    public helpers.AssertionEncryptor.KeyInfoStyle getSelectedKeyInfoStyle() {
+        return (helpers.AssertionEncryptor.KeyInfoStyle) cmbboxKeyInfoStyle.getSelectedItem();
     }
 
     public void setXSWList(String[] xswTypes) {
@@ -339,10 +352,13 @@ public class SamlPanelAction extends JPanel {
         btnCommentInject.setEnabled(false);
         btnHMACConfusion.setEnabled(false);
         btnResponseXSS.setEnabled(false);
+        btnRefreshTimestamps.setEnabled(false);
         btnExtendValidity.setEnabled(false);
         btnStatusSuccess.setEnabled(false);
         btnRemoveAudience.setEnabled(false);
         btnDigestTamper.setEnabled(false);
+        cmbboxKeyInfoStyle.setEnabled(false);
+        btnEncryptAssertion.setEnabled(false);
         cmbboxEncMode.setEnabled(false);
         btnEncSSRF.setEnabled(false);
         cmbboxSigRefMode.setEnabled(false);
@@ -380,10 +396,13 @@ public class SamlPanelAction extends JPanel {
         btnCommentInject.setEnabled(true);
         btnHMACConfusion.setEnabled(true);
         btnResponseXSS.setEnabled(true);
+        btnRefreshTimestamps.setEnabled(true);
         btnExtendValidity.setEnabled(true);
         btnStatusSuccess.setEnabled(true);
         btnRemoveAudience.setEnabled(true);
         btnDigestTamper.setEnabled(true);
+        cmbboxKeyInfoStyle.setEnabled(true);
+        btnEncryptAssertion.setEnabled(true);
         cmbboxEncMode.setEnabled(true);
         btnEncSSRF.setEnabled(true);
         cmbboxSigRefMode.setEnabled(true);
